@@ -26,6 +26,7 @@ Some MIDI-to-performance pipelines (such as using commercial VSTs) do not handle
 
 - Tempo-aware pedal gap enforcement
 - Adjustable minimum gap (`--gap-seconds`)
+- Three gap creation modes (`--gap-mode`) to control which side of the pedal change is adjusted
 - Debug mode (`--debug`) for per-adjustment logging
 - Auto-generated output filename (`*_pedalfix.mid`, with numeric suffix if needed)
 
@@ -54,6 +55,16 @@ With custom gap (example: 120 ms):
 python pedalfix.py input.mid --gap-seconds 0.12
 ```
 
+With a custom gap mode:
+
+```bash
+# Shorten the previous pedal instead of delaying the next one
+python pedalfix.py input.mid --gap-mode shorten_previous
+
+# Split the gap evenly between both sides (centers the gap on the pedal change point)
+python pedalfix.py input.mid --gap-mode both
+```
+
 With debug output:
 
 ```bash
@@ -63,7 +74,7 @@ python pedalfix.py input.mid --debug
 Short flags:
 
 ```bash
-python pedalfix.py input.mid -g 0.15 -d
+python pedalfix.py input.mid -g 0.15 -m both -d
 ```
 
 ## Input and Output
@@ -76,9 +87,12 @@ python pedalfix.py input.mid -g 0.15 -d
 
 1. Builds a global tempo map from all `set_tempo` events.
 2. Walks each track and monitors sustain pedal control changes (`CC64`).
-3. For each pedal-up -> pedal-down transition, computes real elapsed time using the tempo map.
-4. If elapsed time is below threshold, adds just enough ticks to meet the minimum gap.
-5. Carries that added time as `time_debt` so subsequent messages are compensated, reducing desync risk.
+3. For each pedal-up → pedal-down transition, computes real elapsed time using the tempo map.
+4. If elapsed time is below threshold, calculates how many ticks are needed to meet the minimum gap.
+5. Applies the correction according to `--gap-mode`:
+   - `delay_next` *(default)*: adds the needed ticks to the next pedal-down's delta time, then carries the added time as `time_debt` so subsequent messages are compensated.
+   - `shorten_previous`: subtracts the needed ticks from the previous pedal-up's delta time (moving it earlier), then compensates the immediately following message so all other events remain in place.
+   - `both`: splits the needed ticks evenly — half is taken from the previous pedal-up (as above) and half is added to the next pedal-down (as above), centering the gap on the original pedal change point.
 
 ## Notes
 

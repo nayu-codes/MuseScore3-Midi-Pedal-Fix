@@ -75,7 +75,7 @@ def seconds_to_ticks(seconds, tempo, ticks_per_beat):
         return 0
     return int((seconds * 1_000_000.0 * ticks_per_beat + tempo - 1) // tempo)
 
-def process_pedal(input_file, output_file, gap_seconds=0.15, debug=False):
+def process_pedal(input_file, output_file, gap_seconds=0.15, gap_mode='delay_next', debug=False):
     if not os.path.exists(input_file):
         print(f"Error: Input file '{input_file}' not found.")
         return
@@ -89,12 +89,16 @@ def process_pedal(input_file, output_file, gap_seconds=0.15, debug=False):
     total_adjustments = 0
     total_added_ticks = 0
 
+    apply_shorten = gap_mode in ('shorten_previous', 'both')
+    apply_delay = gap_mode in ('delay_next', 'both')
+
     for track_index, track in enumerate(mid.tracks):
         new_track = mido.MidiTrack()
         new_mid.tracks.append(new_track)
         
         last_val = 0
         last_pedal_up_abs_tick = None
+        last_pedal_up_new_track_idx = None  # Index in new_track where pedal-up was appended
         time_debt = 0 # Tracks how much we've shifted the timeline
         original_abs_tick = 0
         
@@ -113,6 +117,8 @@ def process_pedal(input_file, output_file, gap_seconds=0.15, debug=False):
             if msg.type == 'control_change' and msg.control == 64:
                 if msg.value < 64:
                     last_pedal_up_abs_tick = original_abs_tick
+                    # Record where the pedal-up will be stored in new_track (appended at end of loop)
+                    last_pedal_up_new_track_idx = len(new_track)
 
                 # If Pedal Down (>=64) follows Pedal Up (<64)
                 if msg.value >= 64 and last_val < 64:
@@ -132,29 +138,61 @@ def process_pedal(input_file, output_file, gap_seconds=0.15, debug=False):
                                 tempo_segments,
                                 tempo_starts,
                             )
-                            added_time = seconds_to_ticks(
+                            needed_ticks = seconds_to_ticks(
                                 missing_seconds,
                                 current_tempo,
                                 mid.ticks_per_beat,
                             )
                         else:
-                            added_time = 0
+                            needed_ticks = 0
 
                     else:
-                        added_time = 0
+                        needed_ticks = 0
 
-                    if added_time > 0:
-                        msg.time += added_time
-                        # We must subtract this added time from the NEXT message
-                        time_debt += added_time
+                    if needed_ticks > 0:
+                        actual_shortened = 0
+                        actual_delayed = 0
+
+                        if apply_shorten:
+                            # How many ticks to take from the previous pedal-up.
+                            # 'both' splits the gap: half from previous, half to next.
+                            shorten_ticks = needed_ticks if gap_mode == 'shorten_previous' else needed_ticks // 2
+                            pu_idx = last_pedal_up_new_track_idx
+
+                            if pu_idx is not None and pu_idx < len(new_track):
+                                # Cap the reduction at the pedal-up's own delta so it never goes negative.
+                                reducible = min(new_track[pu_idx].time, shorten_ticks)
+                                if reducible > 0:
+                                    new_track[pu_idx].time -= reducible
+                                    # Compensate the next message so its absolute time is unchanged.
+                                    # If no message exists between pedal-up and pedal-down,
+                                    # the pedal-down (current msg) is the next message.
+                                    next_idx = pu_idx + 1
+                                    if next_idx < len(new_track):
+                                        new_track[next_idx].time += reducible
+                                    else:
+                                        msg.time += reducible
+                                    actual_shortened = reducible
+
+                        if apply_delay:
+                            # How many ticks to add to the next pedal-down.
+                            # 'both' uses ceiling(needed_ticks / 2) so that shorten + delay == needed_ticks.
+                            delay_ticks = needed_ticks if gap_mode == 'delay_next' else (needed_ticks - needed_ticks // 2)
+                            msg.time += delay_ticks
+                            # We must subtract this added time from the NEXT message
+                            time_debt += delay_ticks
+                            actual_delayed = delay_ticks
+
                         total_adjustments += 1
-                        total_added_ticks += added_time
+                        total_added_ticks += needed_ticks
 
                         if debug:
-                            final_gap = elapsed_seconds + (added_time * current_tempo) / (1_000_000.0 * mid.ticks_per_beat)
+                            final_gap = elapsed_seconds + (needed_ticks * current_tempo) / (1_000_000.0 * mid.ticks_per_beat)
                             print(
                                 f"[debug] track={track_index} tick={original_abs_tick} "
-                                f"elapsed={elapsed_seconds:.6f}s add_ticks={added_time} final_gap={final_gap:.6f}s"
+                                f"elapsed={elapsed_seconds:.6f}s needed_ticks={needed_ticks} "
+                                f"shortened={actual_shortened} delayed={actual_delayed} "
+                                f"final_gap≈{final_gap:.6f}s"
                             )
                 
                 last_val = msg.value
@@ -181,6 +219,19 @@ if __name__ == "__main__":
         help="Minimum pedal-up to pedal-down gap in seconds (default: 0.15)",
     )
     parser.add_argument(
+        "-m",
+        "--gap-mode",
+        choices=["delay_next", "shorten_previous", "both"],
+        default="delay_next",
+        help=(
+            "How to create the gap between pedal transitions (default: delay_next). "
+            "'delay_next' delays the start of the next pedal-down. "
+            "'shorten_previous' ends the previous pedal sooner by moving the pedal-up earlier. "
+            "'both' splits the gap evenly between both methods, centering it on the original "
+            "pedal change point."
+        ),
+    )
+    parser.add_argument(
         "-d",
         "--debug",
         action="store_true",
@@ -198,4 +249,4 @@ if __name__ == "__main__":
             i += 1
         output_file = f"{base}_{i}{ext}"
 
-    process_pedal(args.input, output_file, gap_seconds=args.gap_seconds, debug=args.debug)
+    process_pedal(args.input, output_file, gap_seconds=args.gap_seconds, gap_mode=args.gap_mode, debug=args.debug)
